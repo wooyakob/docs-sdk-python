@@ -26,7 +26,7 @@ A modern fashion retailer stores its data across several document types:
 | `product::{sku}` | `product` | Catalog entry — name, brand, price, description
 | `inventory::{sku}::{size}::{color}` | `inventory` | Per-variant stock levels
 | `customer::{id}` | `customer` | Customer profile, loyalty points, order history
-| `order::{uuid}` | `order` | Order created atomically by a transaction
+| `order::{uuid}` | `order` | Created atomically by a transaction
 |===
 
 Without distributed transactions, updating several of these documents requires complex application-level compensation logic.
@@ -57,11 +57,18 @@ include::example$ecommerce_distributed_transactions.py[tag=seed,indent=0]
 Placing an order must atomically:
 
 . Verify that sufficient stock exists, then decrement `quantity_available` and increment `quantity_reserved` on the inventory document.
-. Read the current price from the product catalog and create a new order document.
+. Check if a sale price is stamped on the inventory document (`current_price`), falling back to the product catalog only when it is absent.
+This avoids an extra transactional read when a flash sale is active.
+. Create a new order document.
 . Award loyalty points (1 point per dollar) on the customer document.
 
 If inventory is insufficient, the {lambda} raises a `ValueError`, causing an immediate rollback.
 The customer profile and inventory are never left partially updated.
+
+[NOTE]
+====
+`TransactionCommitAmbiguous` is re-raised by `place_order` so callers can detect an ambiguous outcome and verify the order state on the server before retrying.
+====
 
 [source,python]
 ----
@@ -100,7 +107,11 @@ A return reverses the side-effects of the original order — atomically:
 include::example$ecommerce_distributed_transactions.py[tag=process-return,indent=0]
 ----
 
-The `max(0, …)` guard ensures loyalty points never go negative, even if the customer spent points between the purchase and the return.
+Note that `original_status` is captured *before* overwriting `order["status"]`.
+This is important: `quantity_reserved` should only be decremented if the order was in `confirmed` state.
+For orders that were already `shipped`, `fulfill_order` has already released the reservation — decrementing it again would corrupt the count for other pending orders.
+
+The `max(0, …)` guard on loyalty points ensures they never go negative, even if the customer spent points between the purchase and the return.
 
 == Transaction: Flash Sale Pricing
 
@@ -111,6 +122,8 @@ With a distributed transaction, both documents are updated atomically — custom
 ----
 include::example$ecommerce_distributed_transactions.py[tag=flash-sale,indent=0]
 ----
+
+Using `prod.get("original_price", prod["price"])` as the base ensures this operation is idempotent: calling `apply_flash_sale` a second time applies the discount from the original price, not from the already-discounted one.
 
 == Error Handling
 
@@ -124,7 +137,7 @@ The application can safely retry or surface the error to the user.
 `TransactionCommitAmbiguous`::
 The transaction *may or may not have committed*.
 This can happen when a network or node failure occurs after the transaction reached the commit point but before the client received confirmation.
-The application should query the affected documents to determine the actual state before deciding to retry.
+The exception should be re-raised (or surfaced as a distinct status) so the caller knows it must query the affected documents to determine the actual state before deciding to retry.
 
 [source,python]
 ----
@@ -170,13 +183,13 @@ The transaction configuration used in this example:
 ----
 TransactionConfig(
     durability=ServerDurability(DurabilityLevel.MAJORITY),  # <1>
-    expiration_time=timedelta(seconds=30),                  # <2>
+    timeout=timedelta(seconds=30),                          # <2>
 )
 ----
 
 <1> `MAJORITY` durability requires the write to be persisted on a majority of replicas before the transaction commits.
 This is the recommended setting for production e-commerce workloads.
-<2> `expiration_time` sets the maximum wall-clock time a transaction may run.
+<2> `timeout` sets the maximum wall-clock time a transaction may run.
 Long-running transactions hold document locks longer, so keep this value as low as your workload allows.
 
 == Additional Resources

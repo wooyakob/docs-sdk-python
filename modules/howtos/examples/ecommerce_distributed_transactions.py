@@ -18,7 +18,6 @@ from couchbase.auth import PasswordAuthenticator
 from couchbase.cluster import Cluster
 from couchbase.durability import DurabilityLevel, ServerDurability
 from couchbase.exceptions import (
-    DocumentNotFoundException,
     TransactionCommitAmbiguous,
     TransactionFailed,
 )
@@ -34,7 +33,7 @@ def connect():
         authenticator=PasswordAuthenticator("Administrator", "password"),
         transaction_config=TransactionConfig(
             durability=ServerDurability(DurabilityLevel.MAJORITY),
-            expiration_time=timedelta(seconds=30),
+            timeout=timedelta(seconds=30),
         ),
     )
     cluster = Cluster.connect("couchbase://localhost", opts)
@@ -105,10 +104,12 @@ def place_order(cluster, collection, customer_id, inventory_id, product_id, quan
         inv["quantity_reserved"] += quantity
         ctx.replace(inv_doc, inv)
 
-        # Read current price from the product catalog
-        prod_doc = ctx.get(collection, product_id)
-        prod = prod_doc.content_as[dict]
-        unit_price = prod["price"]
+        # Use the stamped sale price on the inventory doc if available,
+        # otherwise fall back to the product catalog for the current price.
+        unit_price = inv.get("current_price")
+        if unit_price is None:
+            prod_doc = ctx.get(collection, product_id)
+            unit_price = prod_doc.content_as[dict]["price"]
         total = round(unit_price * quantity, 2)
 
         # Create the order
@@ -132,7 +133,7 @@ def place_order(cluster, collection, customer_id, inventory_id, product_id, quan
         cust_doc = ctx.get(collection, customer_id)
         cust = cust_doc.content_as[dict]
         cust["loyalty_points"] += int(total)
-        cust["orders"].append(order_id)
+        cust.setdefault("orders", []).append(order_id)
         ctx.replace(cust_doc, cust)
 
     try:
@@ -142,9 +143,10 @@ def place_order(cluster, collection, customer_id, inventory_id, product_id, quan
         print(f"Order failed (did not commit): {ex}")
         return None
     except TransactionCommitAmbiguous as ex:
-        # Transaction may or may not have committed — check server state.
+        # Transaction may or may not have committed — the caller must query
+        # the order document to determine the final state before retrying.
         print(f"Order outcome ambiguous: {ex}")
-        return order_id
+        raise
 # end::place-order[]
 
 
@@ -200,9 +202,11 @@ def process_return(cluster, collection, order_id, customer_id, inventory_id):
         order_doc = ctx.get(collection, order_id)
         order = order_doc.content_as[dict]
 
-        if order["status"] not in ("confirmed", "shipped"):
+        # Capture original_status before overwriting so we can use it below.
+        original_status = order["status"]
+        if original_status not in ("confirmed", "shipped"):
             raise ValueError(
-                f"Order {order_id} cannot be returned (status: {order['status']})"
+                f"Order {order_id} cannot be returned (status: {original_status})"
             )
 
         returned_qty = sum(i["quantity"] for i in order["items"])
@@ -213,7 +217,10 @@ def process_return(cluster, collection, order_id, customer_id, inventory_id):
         inv_doc = ctx.get(collection, inventory_id)
         inv = inv_doc.content_as[dict]
         inv["quantity_available"] += returned_qty
-        inv["quantity_reserved"] = max(0, inv["quantity_reserved"] - returned_qty)
+        # Only release the reservation if the order was not yet fulfilled.
+        # For shipped orders, fulfill_order already cleared quantity_reserved.
+        if original_status == "confirmed":
+            inv["quantity_reserved"] = max(0, inv["quantity_reserved"] - returned_qty)
         ctx.replace(inv_doc, inv)
 
         cust_doc = ctx.get(collection, customer_id)
@@ -240,7 +247,9 @@ def apply_flash_sale(cluster, collection, product_id, inventory_id, discount_pct
         prod_doc = ctx.get(collection, product_id)
         prod = prod_doc.content_as[dict]
 
-        original_price = prod["price"]
+        # Use the stored original price as the base so repeated calls
+        # to apply_flash_sale do not compound the discount.
+        original_price = prod.get("original_price", prod["price"])
         sale_price = round(original_price * (1 - discount_pct / 100), 2)
         prod["original_price"] = original_price
         prod["price"] = sale_price
@@ -270,8 +279,8 @@ def place_order_with_full_error_handling(
     """
     Demonstrates complete error handling for distributed transactions.
     TransactionFailed guarantees the transaction did NOT commit.
-    TransactionCommitAmbiguous means the outcome is unknown — the application
-    should query Couchbase to determine the final state before retrying.
+    TransactionCommitAmbiguous means the outcome is unknown — re-raise it
+    so the caller can query Couchbase to determine the final state.
     """
     order_id = f"order::{uuid.uuid4()}"
 
@@ -287,8 +296,10 @@ def place_order_with_full_error_handling(
         inv["quantity_reserved"] += quantity
         ctx.replace(inv_doc, inv)
 
-        prod_doc = ctx.get(collection, product_id)
-        unit_price = prod_doc.content_as[dict]["price"]
+        unit_price = inv.get("current_price")
+        if unit_price is None:
+            prod_doc = ctx.get(collection, product_id)
+            unit_price = prod_doc.content_as[dict]["price"]
         total = round(unit_price * quantity, 2)
 
         ctx.insert(collection, order_id, {
@@ -309,9 +320,10 @@ def place_order_with_full_error_handling(
         return order_id
     except TransactionCommitAmbiguous as ex:
         # The transaction may or may not have reached the commit point.
-        # Query the order document to confirm before deciding to retry.
+        # Re-raise so the caller can query the order document to confirm
+        # before deciding to retry.
         print(f"Transaction outcome ambiguous — verify order {order_id}: {ex}")
-        return order_id
+        raise
     except TransactionFailed as ex:
         # The transaction definitely did not commit. Safe to retry or report failure.
         print(f"Transaction did not commit: {ex}")
