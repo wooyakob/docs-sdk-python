@@ -1,0 +1,199 @@
+= E-Commerce Distributed Transactions: Fashion Retailer Example
+:description: Build a fashion retailer e-commerce platform using distributed ACID transactions with the Couchbase Python SDK.
+:page-topic-type: howto
+:page-toclevels: 2
+:page-pagination: prev
+
+include::project-docs:partial$attributes.adoc[]
+include::partial$acid-transactions-attributes.adoc[]
+
+[abstract]
+{description}
+
+This guide walks through a practical e-commerce scenario — a fashion retailer — to demonstrate how to use Couchbase distributed ACID transactions from the Python SDK.
+Every business-critical operation (placing an order, fulfilling it, processing a return, or running a flash sale) is wrapped in a single atomic transaction that spans multiple documents.
+
+Refer to xref:howtos:distributed-acid-transactions-from-the-sdk.adoc[] for a comprehensive reference on the transactions API.
+
+== Overview
+
+A modern fashion retailer stores its data across several document types:
+
+[cols="1,2,3"]
+|===
+| Document key pattern | Type | Purpose
+
+| `product::{sku}` | `product` | Catalog entry — name, brand, price, description
+| `inventory::{sku}::{size}::{color}` | `inventory` | Per-variant stock levels
+| `customer::{id}` | `customer` | Customer profile, loyalty points, order history
+| `order::{uuid}` | `order` | Created atomically by a transaction
+|===
+
+Without distributed transactions, updating several of these documents requires complex application-level compensation logic.
+With Couchbase transactions, all documents are updated atomically — either all changes commit together, or none of them do.
+
+== Setup
+
+=== Connection and Transaction Configuration
+
+Configure `MAJORITY` durability to ensure writes survive a node failure before the transaction commits.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=connect,indent=0]
+----
+
+=== Seed Data
+
+The helper below creates the initial product, inventory, and customer documents that the transactions will operate on.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=seed,indent=0]
+----
+
+== Transaction: Place an Order
+
+Placing an order must atomically:
+
+. Verify that sufficient stock exists, then decrement `quantity_available` and increment `quantity_reserved` on the inventory document.
+. Check if a sale price is stamped on the inventory document (`current_price`), falling back to the product catalog only when it is absent.
+This avoids an extra transactional read when a flash sale is active.
+. Create a new order document.
+. Award loyalty points (1 point per dollar) on the customer document.
+
+If inventory is insufficient, the {lambda} raises a `ValueError`, causing an immediate rollback.
+The customer profile and inventory are never left partially updated.
+
+[NOTE]
+====
+`TransactionCommitAmbiguous` is re-raised by `place_order` so callers can detect an ambiguous outcome and verify the order state on the server before retrying.
+====
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=place-order,indent=0]
+----
+
+[NOTE]
+====
+Always use `ctx.get()`, `ctx.insert()`, `ctx.replace()`, and `ctx.remove()` inside the {lambda}.
+Using the collection directly (e.g. `collection.insert()`) bypasses transactional tracking and will produce inconsistent results.
+====
+
+== Transaction: Fulfill an Order
+
+When the warehouse ships an order, three documents must change in concert:
+
+. The order status changes from `confirmed` to `shipped`.
+. The reserved quantity is released from the inventory document.
+. The customer receives a 10-point shipment bonus.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=fulfill-order,indent=0]
+----
+
+== Transaction: Process a Return
+
+A return reverses the side-effects of the original order — atomically:
+
+. The order document is marked `returned`.
+. Available inventory is restored.
+. Loyalty points earned from the purchase are deducted.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=process-return,indent=0]
+----
+
+Note that `original_status` is captured *before* overwriting `order["status"]`.
+This is important: `quantity_reserved` should only be decremented if the order was in `confirmed` state.
+For orders that were already `shipped`, `fulfill_order` has already released the reservation — decrementing it again would corrupt the count for other pending orders.
+
+The `max(0, …)` guard on loyalty points ensures they never go negative, even if the customer spent points between the purchase and the return.
+
+== Transaction: Flash Sale Pricing
+
+A common e-commerce challenge is keeping the product catalog and inventory snapshot price in sync during a sale.
+With a distributed transaction, both documents are updated atomically — customers can never see the new catalog price while inventory still carries the old one.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=flash-sale,indent=0]
+----
+
+Using `prod.get("original_price", prod["price"])` as the base ensures this operation is idempotent: calling `apply_flash_sale` a second time applies the discount from the original price, not from the already-discounted one.
+
+== Error Handling
+
+Couchbase transactions surface two distinct exception types that require different handling strategies.
+
+`TransactionFailed`::
+The transaction *definitely did not commit*.
+No changes were applied to any document.
+The application can safely retry or surface the error to the user.
+
+`TransactionCommitAmbiguous`::
+The transaction *may or may not have committed*.
+This can happen when a network or node failure occurs after the transaction reached the commit point but before the client received confirmation.
+The exception should be re-raised (or surfaced as a distinct status) so the caller knows it must query the affected documents to determine the actual state before deciding to retry.
+
+[source,python]
+----
+include::example$ecommerce_distributed_transactions.py[tag=error-handling,indent=0]
+----
+
+[TIP]
+====
+Check `result.unstaging_complete` after a successful `run()` call.
+In the rare case where it is `False`, the transaction committed but asynchronous cleanup is still in progress.
+Data is already visible to other transactions; no action is required from the application.
+====
+
+== Rollback on Business Logic Errors
+
+Raising any exception inside the transaction {lambda} triggers an automatic rollback.
+This makes it straightforward to enforce business rules atomically:
+
+[source,python]
+----
+# Inside the transaction lambda
+if inv["quantity_available"] < quantity:
+    raise ValueError("Out of stock")  # rolls back all changes made so far
+----
+
+The SDK will not retry the transaction after a user-raised exception — it propagates the exception to the caller wrapped in `TransactionFailed`.
+
+== Concurrency Considerations
+
+The Couchbase transactions protocol handles document-level locking automatically.
+If two concurrent transactions attempt to modify the same inventory document, one will detect the conflict and retry transparently.
+
+However, you should *never* mix transactional and non-transactional writes to the same document within the same request path.
+Non-transactional writes (e.g. `collection.replace()`) can silently overwrite a transaction's staged mutations.
+
+See xref:concept-docs:transactions.adoc#concurrency-with-non-transactional-writes[Concurrency with Non-Transactional Writes] for details.
+
+== Configuration Reference
+
+The transaction configuration used in this example:
+
+[source,python]
+----
+TransactionConfig(
+    durability=ServerDurability(DurabilityLevel.MAJORITY),  # <1>
+    timeout=timedelta(seconds=30),                          # <2>
+)
+----
+
+<1> `MAJORITY` durability requires the write to be persisted on a majority of replicas before the transaction commits.
+This is the recommended setting for production e-commerce workloads.
+<2> `timeout` sets the maximum wall-clock time a transaction may run.
+Long-running transactions hold document locks longer, so keep this value as low as your workload allows.
+
+== Additional Resources
+
+* xref:howtos:distributed-acid-transactions-from-the-sdk.adoc[] — full transactions API reference
+* xref:concept-docs:transactions.adoc[] — how Couchbase distributed transactions work
+* https://docs.couchbase.com/sdk-api/couchbase-python-client/[Python SDK API Reference]
